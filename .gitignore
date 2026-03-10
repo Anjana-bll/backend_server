@@ -1,0 +1,21 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn.lock
+
+# Logs & runtime data
+logs/
+*.log
+pids/
+*.pid
+*.seed
+coverage/
+
+# Env/Secrets
+.env
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
