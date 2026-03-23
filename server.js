@@ -36,6 +36,9 @@ const MQTT_TEST_MODE = true;
 // Track active timeouts for cleanup
 const activeTimeouts = new Map();
 
+// Normalize helper (match your ESP32/STM32 expectations)
+const normalizeFeatureId = (name) => name.toLowerCase().replace(/\s+/g, '_');
+
 // ============================================================
 // HELPER FUNCTIONS
 // ============================================================
@@ -70,8 +73,8 @@ async function triggerActivation(vin, featureName, vehicleFeaturesId) {
     console.log('\n==========================================');
     console.log('TRIGGER ACTIVATION SERVICE');
     console.log('==========================================');
-    console.log('   VIN:', vin);
-    console.log('   Feature:', featureName);
+    console.log('VIN:', vin);
+    console.log('Feature:', featureName);
 
     // Check if already processing (idempotency)
     const { data: existingJob } = await supabase
@@ -113,7 +116,7 @@ async function triggerActivation(vin, featureName, vehicleFeaturesId) {
     // Sign and publish OTA
     const signature = signPayload(featureName);
     const otaPayload = {
-      featureId: featureName.toLowerCase().replace(/\s+/g, '_'),
+      featureId: normalizeFeatureId(featureName),
       action: 'ENABLE',
       nonce: nonce,
       exp: Math.floor(expiresAt.getTime() / 1000),
@@ -623,14 +626,14 @@ mqttClient.on('message', async (topic, message) => {
 
         if (!matchedFeature) {
           console.log('ERROR: No matching feature found');
-          console.log('  Received normalized:', receivedNameNormalized);
-          console.log('  Database features:', allFeatures.map(f => `${f.feature_name} (normalized: ${normalizeString(f.feature_name)})`));
+          console.log('Received normalized:', receivedNameNormalized);
+          console.log('Database features:', allFeatures.map(f => `${f.feature_name} (normalized: ${normalizeString(f.feature_name)})`));
           return;
         }
 
         featureName = matchedFeature.feature_name;
-        console.log('✅ Matched feature name:', featureName);
-        console.log('✅ Matched feature ID:', matchedFeature.id);
+        console.log('Matched feature name:', featureName);
+        console.log('Matched feature ID:', matchedFeature.id);
 
         const { data: purchaseList, error: updateError } = await supabase
           .from('vehicle_features')
@@ -658,7 +661,7 @@ mqttClient.on('message', async (topic, message) => {
           .update({ status: 'enabled', updated_at: new Date().toISOString() })
           .eq('vehicle_features_id', matchedFeature.id);
 
-        console.log('✅ Feature ENABLED');
+        console.log('Feature ENABLED');
         Logger.logActivation(purchase.id, vin, featureName, 'ENABLE', 'enabled', 0);
 
       } else if (payload.success === false) {
