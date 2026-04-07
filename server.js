@@ -7,12 +7,19 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const { createClient } = require('@supabase/supabase-js');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const Razorpay = require('razorpay');
 const Logger = require('./logger');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+console.log("Razorpay KEY:", process.env.RAZORPAY_KEY_ID);
+console.log("Razorpay SECRET:", process.env.RAZORPAY_KEY_SECRET ? "Loaded" : "Missing");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -63,6 +70,20 @@ const signPayload = (featureName) => {
   hmac.update(featureName);
   return hmac.digest('base64');
 };
+
+//for razorpay webhook signature verification
+function verifyRazorpaySignature({
+  orderId,
+  paymentId,
+  signature,
+}) {
+  const expectedSignature = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update(`${orderId}|${paymentId}`)
+    .digest('hex');
+
+  return expectedSignature === signature;
+}
 
 // ============================================================
 // IDEMPOTENT ACTIVATION SERVICE
@@ -310,99 +331,124 @@ app.get('/api/features', async (req, res) => {
 // PAYMENT ENDPOINTS
 // ============================================================
 
-// Get Stripe config
-app.get('/api/stripe/config', (req, res) => {
-  res.json({
-    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY
-  });
-});
-
 app.post('/api/purchase', authenticateToken, async (req, res) => {
   try {
     const { vehicleId, featureName } = req.body;
     const phone = req.user.phone;
 
-    console.log('\n==========================================');
-    console.log('PURCHASE REQUEST');
-    console.log('==========================================');
-    console.log({ phone, vehicleId, featureName });
+    console.log('Incoming purchase request');
 
-    const { data: feature } = await supabase
+    const { data: feature, error: featureError } = await supabase
       .from('features')
       .select('*')
       .eq('feature_name', featureName)
       .single();
 
-    if (!feature) throw new Error('Feature not found');
+    console.log('Feature:', feature, 'Error:', featureError);
 
-    const { data: user } = await supabase
-      .from('users')
-      .select('vin_number')
-      .eq('phone', phone)
-      .single();
+    // const amountInPaise = Math.round(feature.price * 100);
+    const amount = Math.round(feature.price*100, 100);
 
-    if (user.vin_number !== vehicleId) {
-      return res.status(403).json({ success: false, message: 'Unauthorized' });
-    }
+    console.log('Creating Razorpay order...');
 
-    // Create Stripe PaymentIntent
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(feature.price * 100),
-      currency: 'inr',
-      description: `${featureName} for ${vehicleId}`
+    const razorpayOrder = await razorpay.orders.create({
+      amount: amount,
+      currency: 'INR',
+      receipt: `receipt_${vehicleId}_${Date.now()}`,
     });
 
-    const { data: order } = await supabase
+    console.log('Razorpay Order:', razorpayOrder);
+
+    const { data: purchase, error: insertError } = await supabase
       .from('vehicle_features')
       .insert({
         phone: phone,
         vin: vehicleId,
         feature_name: featureName,
-        amount: feature.price,
+        amount: amount,
         currency: 'inr',
-        payment_intent_id: paymentIntent.id,
+        razorpay_order_id: razorpayOrder.id,
         payment_status: 'pending',
         status: 'pending',
-        created_at: new Date().toISOString()
       })
       .select()
       .single();
 
-    Logger.logPayment(paymentIntent.id, phone, vehicleId, feature.price, 'initiated');
+    console.log('DB INSERT:', purchase, insertError);
 
-    console.log('==========================================\n');
-
-    res.json({
-      success: true,
-      clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id,
-      amount: feature.price
-    });
-
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/payment/success', authenticateToken, async (req, res) => {
-  try {
-    const { paymentIntentId, featureName } = req.body;
-    const phone = req.user.phone;
-
-    console.log('\n ==========================================');
-    console.log('PAYMENT SUCCESS');
-    console.log('==========================================');
-    console.log({ paymentIntentId, featureName, phone });
-
-    // Validate input
-    if (!paymentIntentId || !featureName) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Missing paymentIntentId or featureName' 
+    if (insertError) {
+      console.error('DB ERROR:', insertError);
+      return res.status(500).json({
+        success: false,
+        error: insertError.message,
       });
     }
 
-    // Get user VIN
+    res.json({
+      success: true,
+      key: process.env.RAZORPAY_KEY_ID,
+      orderId: razorpayOrder.id,
+      amount: razorpayOrder.amount,
+      currency: razorpayOrder.currency,
+    });
+
+  } catch (err) {
+    console.error('❌ PURCHASE ERROR:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+//razorpay payment flow:
+app.post('/api/payment/success', authenticateToken, async (req, res) => {
+  try {
+    const {
+      razorpayPaymentId,
+      razorpayOrderId,
+      razorpaySignature,
+      featureName,
+    } = req.body;
+
+    const phone = req.user.phone;
+
+    console.log('\n==========================================');
+    console.log('PAYMENT SUCCESS / VERIFY');
+    console.log('==========================================');
+    console.log({
+      razorpayPaymentId,
+      razorpayOrderId,
+      featureName,
+      phone,
+    });
+
+    if (
+      !razorpayPaymentId ||
+      !razorpayOrderId ||
+      !razorpaySignature ||
+      !featureName
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Missing razorpayPaymentId, razorpayOrderId, razorpaySignature or featureName',
+      });
+    }
+
+    const isSignatureValid = verifyRazorpaySignature({
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      signature: razorpaySignature,
+    });
+
+    if (!isSignatureValid) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid payment signature',
+      });
+    }
+
     const { data: user, error: userError } = await supabase
       .from('users')
       .select('vin_number')
@@ -410,112 +456,79 @@ app.post('/api/payment/success', authenticateToken, async (req, res) => {
       .single();
 
     if (userError || !user?.vin_number) {
-      console.error('User lookup error:', userError?.message);
-      return res.status(404).json({ success: false, message: 'VIN not registered' });
-    }
-
-    const vin = user.vin_number;
-    console.log('User VIN:', vin);
-
-    // Calculate validity (1 year from now by default)
-    const validityDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
-
-    // Check if purchase record exists
-    const { data: existingPurchase, error: fetchError } = await supabase
-      .from('vehicle_features')
-      .select('*')
-      .eq('payment_intent_id', paymentIntentId)
-      .single();
-
-    if (fetchError && fetchError.code !== 'PGRST116') {
-      console.error('Fetch error:', fetchError.message);
-      return res.status(500).json({ success: false, error: fetchError.message });
-    }
-
-    if (!existingPurchase) {
-      console.error('No purchase found with paymentIntentId:', paymentIntentId);
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Payment record not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'VIN not registered',
       });
     }
 
-    console.log('Existing purchase found:', existingPurchase.id);
+    const vin = user.vin_number;
 
-    // Update payment status
+    const { data: existingPurchase, error: fetchError } = await supabase
+      .from('vehicle_features')
+      .select('*')
+      .eq('razorpay_order_id', razorpayOrderId)
+      .single();
+
+    if (fetchError && fetchError.code !== 'PGRST116') {
+      return res.status(500).json({
+        success: false,
+        error: fetchError.message,
+      });
+    }
+
+    if (!existingPurchase) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment record not found',
+      });
+    }
+
     const { data: purchase, error: updateError } = await supabase
       .from('vehicle_features')
       .update({
+        razorpay_payment_id: razorpayPaymentId,
+        razorpay_signature: razorpaySignature,
         payment_status: 'success',
         status: 'processing',
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
       })
-      .eq('payment_intent_id', paymentIntentId)
+      .eq('razorpay_order_id', razorpayOrderId)
       .select()
       .single();
 
     if (updateError || !purchase) {
-      console.error('Update error:', updateError?.message);
-      return res.status(500).json({ 
-        success: false, 
+      return res.status(500).json({
+        success: false,
         message: 'Failed to update payment status',
-        error: updateError?.message
+        error: updateError?.message,
       });
     }
 
-    console.log('Payment status updated');
-    console.log('NOTE: Validity column will be set once added to database');
+    Logger.logPayment(
+      razorpayPaymentId,
+      phone,
+      vin,
+      purchase.amount,
+      'success'
+    );
 
-    Logger.logPayment(paymentIntentId, phone, vin, purchase.amount, 'success');
-
-    // ============ TRIGGER ACTIVATION ============
     await triggerActivation(vin, featureName, purchase.id);
 
     console.log('==========================================\n');
 
     res.json({
       success: true,
-      message: 'Payment recorded, activation triggered',
-      purchaseId: purchase.id
+      message: 'Payment verified, recorded and activation triggered',
+      purchaseId: purchase.id,
     });
-
   } catch (err) {
-    console.error('Payment success error:', err);
-    Logger.logPayment(req.body.paymentIntentId, req.user.phone, '', 0, 'failed');
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ============================================================
-// WEBHOOK ENDPOINTS
-// ============================================================
-
-app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (req, res) => {
-  try {
-    const sig = req.headers['stripe-signature'];
-    const event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-
-    console.log('Stripe webhook received:', event.type);
-
-    if (event.type === 'payment_intent.succeeded') {
-      const paymentIntent = event.data.object;
-      console.log('Payment succeeded:', paymentIntent.id);
-
-      await supabase
-        .from('vehicle_features')
-        .update({ payment_status: 'success' })
-        .eq('payment_intent_id', paymentIntent.id);
-    }
-
-    res.json({ success: true });
-
-  } catch (err) {
-    console.error('WEBHOOK ERROR:', err);
-    res.status(400).json({ error: err.message });
+    console.error('Payment verification error:', err);
+    Logger.logPayment(req.body.razorpayPaymentId || '', req.user.phone, '', 0, 'failed');
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 
@@ -552,14 +565,15 @@ app.get('/api/entitlements', authenticateToken, async (req, res) => {
       return {
         id: p.id,
         featureName: p.feature_name,
-        paymentIntentId: p.payment_intent_id,
+        razorpayOrderId: p.razorpay_order_id,
+        razorpayPaymentId: p.razorpay_payment_id,
         purchaseDate: p.created_at,
         paymentStatus: p.payment_status,
         entitlementState: state,
         status: p.status,
         amount: p.amount,
-        enabledDate: p.enabled_date,
-        validity: p.validity
+        enabledDate: p.validity_start,
+        validity: p.validity_end
       };
     });
 
